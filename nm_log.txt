@@ -1,0 +1,9 @@
+[2025-11-05 00:15:28] Storage Server 127.0.0.1:9001 registered
+[2025-11-05 00:16:17] CREATE request from manik for file p.txt
+[2025-11-05 00:16:23] LIST USERS request from arnav
+[2025-11-05 00:16:55] ACCESS CONTROL from manik for file p.txt, target arnav
+[2025-11-05 00:17:06] ACCESS CONTROL from manik for file p.txt, target arnav
+[2025-11-05 00:17:37] SS lookup from manik for file p.txt, operation 105
+[2025-11-05 00:17:53] Storage Server 127.0.0.1:9001 registered
+[2025-11-05 00:18:07] SS lookup from manik for file p.txt, operation 105
+[2025-11-05 00:26:02] Storage Server 127.0.0.1:9001 registered
