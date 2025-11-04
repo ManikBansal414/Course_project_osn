@@ -331,14 +331,15 @@ void handle_write(int sock, Message* msg) {
             target_sentence = sentences[sentence_index];
         }
         
-        // Parse words in sentence
+        // Parse words in sentence using thread-safe strtok_r
         char words[1000][MAX_WORD_LENGTH];
         int word_count = 0;
         
-        char* token = strtok(target_sentence, " ");
+        char* saveptr1;
+        char* token = strtok_r(target_sentence, " ", &saveptr1);
         while (token && word_count < 1000) {
             strcpy(words[word_count++], token);
-            token = strtok(NULL, " ");
+            token = strtok_r(NULL, " ", &saveptr1);
         }
         
         // Validate word index
@@ -357,13 +358,14 @@ void handle_write(int sock, Message* msg) {
         char* content_tokens[1000];
         int content_count = 0;
         
-        // Parse content into tokens
+        // Parse content into tokens using thread-safe strtok_r
         char content_copy[MAX_BUFFER_SIZE];
         strcpy(content_copy, update_msg.data);
-        char* ct = strtok(content_copy, " ");
+        char* saveptr2;
+        char* ct = strtok_r(content_copy, " ", &saveptr2);
         while (ct && content_count < 1000) {
             content_tokens[content_count++] = strdup(ct);
-            ct = strtok(NULL, " ");
+            ct = strtok_r(NULL, " ", &saveptr2);
         }
         
         // Rebuild sentence with inserted content
@@ -444,8 +446,19 @@ void handle_write(int sock, Message* msg) {
 
 // Handle STREAM request
 void handle_stream(int sock, Message* msg) {
-    char buffer[MAX_BUFFER_SIZE];
-    int n = read_file_content(msg->filename, buffer, sizeof(buffer));
+    // Allocate thread-local buffer to avoid race conditions
+    char* buffer = (char*)malloc(MAX_BUFFER_SIZE);
+    if (!buffer) {
+        Message response;
+        memset(&response, 0, sizeof(response));
+        response.type = MSG_RESPONSE;
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "ERROR: Memory allocation failed");
+        send_message(sock, &response);
+        return;
+    }
+    
+    int n = read_file_content(msg->filename, buffer, MAX_BUFFER_SIZE);
     
     Message response;
     memset(&response, 0, sizeof(response));
@@ -455,21 +468,26 @@ void handle_stream(int sock, Message* msg) {
         response.error_code = ERR_FILE_NOT_FOUND;
         strcpy(response.data, "ERROR: Cannot read file");
         send_message(sock, &response);
+        free(buffer);
         return;
     }
     
-    // Send words one by one
-    char* token = strtok(buffer, " \n\t");
+    // Send words one by one using thread-safe strtok_r
+    char* saveptr;
+    char* token = strtok_r(buffer, " \n\t", &saveptr);
     while (token) {
         memset(&response, 0, sizeof(response));
         response.type = MSG_RESPONSE;
         response.error_code = ERR_SUCCESS;
-        strcpy(response.data, token);
+        
+        // Copy token safely
+        strncpy(response.data, token, MAX_BUFFER_SIZE - 1);
+        response.data[MAX_BUFFER_SIZE - 1] = '\0';
         
         send_message(sock, &response);
         usleep(100000); // 0.1 second delay
         
-        token = strtok(NULL, " \n\t");
+        token = strtok_r(NULL, " \n\t", &saveptr);
     }
     
     // Send STOP
@@ -479,7 +497,8 @@ void handle_stream(int sock, Message* msg) {
     strcpy(response.data, "STOP");
     send_message(sock, &response);
     
-    log_to_file("STREAM: %s", msg->filename);
+    free(buffer);
+    log_to_file("STREAM: %s by %s", msg->filename, msg->username);
 }
 
 // Handle UNDO request
