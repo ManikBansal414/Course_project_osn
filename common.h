@@ -53,6 +53,23 @@
 #define MSG_REM_ACCESS 111
 #define MSG_EXEC_FILE 112
 #define MSG_UNDO_FILE 113
+// Bonus: Folders
+#define MSG_CREATE_FOLDER 114
+#define MSG_MOVE_FILE 115
+#define MSG_VIEW_FOLDER 116
+// Bonus: Checkpoints
+#define MSG_CHECKPOINT 117
+#define MSG_VIEW_CHECKPOINT 118
+#define MSG_REVERT_CHECKPOINT 119
+#define MSG_LIST_CHECKPOINTS 120
+// Bonus: Access Requests
+#define MSG_REQUEST_ACCESS 121
+#define MSG_VIEW_REQUESTS 122
+#define MSG_APPROVE_REQUEST 123
+#define MSG_DENY_REQUEST 124
+// Bonus: Search and Metrics
+#define MSG_SEARCH_FILE 125
+#define MSG_GET_METRICS 126
 #define MSG_RESPONSE 200
 #define MSG_SS_CREATE 201
 #define MSG_SS_DELETE 202
@@ -61,6 +78,11 @@
 #define MSG_SS_STREAM 205
 #define MSG_SS_UNDO 206
 #define MSG_SS_STAT 207
+#define MSG_SS_CHECKPOINT 208
+#define MSG_SS_REPLICATE 209
+#define MSG_HEARTBEAT 210
+#define MSG_SS_CREATE_FOLDER 211
+#define MSG_SS_MOVE_FILE 212
 #define MSG_ACK 250
 #define MSG_ERROR 255
 
@@ -82,11 +104,15 @@ typedef struct {
     char target_user[MAX_USERNAME];
     char ss_ip[INET_ADDRSTRLEN];
     int ss_port;
+    // Bonus fields
+    char folder_path[MAX_FILENAME];
+    char checkpoint_tag[MAX_USERNAME];
 } Message;
 
 // File metadata structure
 typedef struct {
     char filename[MAX_FILENAME];
+    char folder_path[MAX_FILENAME]; // Bonus: hierarchical folders
     char owner[MAX_USERNAME];
     time_t created;
     time_t last_modified;
@@ -94,6 +120,7 @@ typedef struct {
     int word_count;
     int char_count;
     int ss_index; // Index of storage server
+    int replica_ss_index; // Bonus: replication
 } FileMetadata;
 
 // User access structure
@@ -109,7 +136,24 @@ typedef struct {
     int client_port;
     int is_active;
     time_t last_heartbeat;
+    int replica_of; // Bonus: -1 if primary, else index of primary SS
 } StorageServerInfo;
+
+// Bonus: Access Request structure
+typedef struct {
+    char filename[MAX_FILENAME];
+    char requester[MAX_USERNAME];
+    int requested_rights; // ACCESS_READ or ACCESS_WRITE
+    time_t request_time;
+} AccessRequest;
+
+// Bonus: Checkpoint structure
+typedef struct {
+    char filename[MAX_FILENAME];
+    char tag[MAX_USERNAME];
+    char content[MAX_BUFFER_SIZE];
+    time_t created;
+} Checkpoint;
 
 // Utility functions
 void log_message(const char* component, const char* format, ...);

@@ -22,6 +22,23 @@ void cmd_add_access(const char* flag, const char* filename, const char* target_u
 void cmd_rem_access(const char* filename, const char* target_user);
 void cmd_exec(const char* filename);
 void cmd_undo(const char* filename);
+// Bonus: Folder operations
+void cmd_create_folder(const char* foldername);
+void cmd_move_file(const char* filename, const char* foldername);
+void cmd_view_folder(const char* foldername);
+// Bonus: Checkpoint operations
+void cmd_checkpoint(const char* filename, const char* tag);
+void cmd_view_checkpoint(const char* filename, const char* tag);
+void cmd_revert_checkpoint(const char* filename, const char* tag);
+void cmd_list_checkpoints(const char* filename);
+// Bonus: Access request operations
+void cmd_request_access(const char* filename, const char* flag);
+void cmd_view_requests();
+void cmd_approve_request(const char* requester, const char* filename);
+void cmd_deny_request(const char* requester, const char* filename);
+// Bonus: Search and metrics
+void cmd_search(const char* pattern);
+void cmd_metrics();
 
 // Connect to Name Server
 void connect_to_nm() {
@@ -55,7 +72,7 @@ void print_menu() {
     printf("\n═══════════════════════════════════════════════════════════\n");
     printf("                  DISTRIBUTED FILE SYSTEM                  \n");
     printf("═══════════════════════════════════════════════════════════\n");
-    printf("Commands:\n");
+    printf("Basic Commands:\n");
     printf("  VIEW [-a] [-l] [-al]      - List files\n");
     printf("  READ <filename>           - Read file content\n");
     printf("  CREATE <filename>         - Create new file\n");
@@ -68,6 +85,28 @@ void print_menu() {
     printf("  REMACCESS <file> <user>   - Remove access\n");
     printf("  EXEC <filename>           - Execute file as commands\n");
     printf("  UNDO <filename>           - Undo last change\n");
+    printf("───────────────────────────────────────────────────────────\n");
+    printf("Bonus - Folders:\n");
+    printf("  CREATEFOLDER <folder>     - Create new folder\n");
+    printf("  MOVE <file> <folder>      - Move file to folder\n");
+    printf("  VIEWFOLDER <folder>       - List files in folder\n");
+    printf("───────────────────────────────────────────────────────────\n");
+    printf("Bonus - Checkpoints:\n");
+    printf("  CHECKPOINT <file> <tag>   - Create checkpoint\n");
+    printf("  VIEWCHECKPOINT <file> <tag> - View checkpoint content\n");
+    printf("  REVERT <file> <tag>       - Revert to checkpoint\n");
+    printf("  LISTCHECKPOINTS <file>    - List all checkpoints\n");
+    printf("───────────────────────────────────────────────────────────\n");
+    printf("Bonus - Access Requests:\n");
+    printf("  REQUESTACCESS -R/-W <file> - Request file access\n");
+    printf("  VIEWREQUESTS              - View pending requests (owner)\n");
+    printf("  APPROVEREQUEST <user> <file> - Approve request\n");
+    printf("  DENYREQUEST <user> <file> - Deny request\n");
+    printf("───────────────────────────────────────────────────────────\n");
+    printf("Bonus - Unique Features:\n");
+    printf("  SEARCH <pattern>          - Search files by name\n");
+    printf("  METRICS                   - View system metrics\n");
+    printf("───────────────────────────────────────────────────────────\n");
     printf("  HELP                      - Show this menu\n");
     printf("  EXIT                      - Exit client\n");
     printf("═══════════════════════════════════════════════════════════\n\n");
@@ -127,7 +166,7 @@ void cmd_read(const char* filename) {
     // Send read request to SS
     memset(&msg, 0, sizeof(msg));
     msg.type = MSG_READ_FILE;
-    strcpy(msg.filename, filename);
+    strcpy(msg.filename, filename); // filename now includes path (e.g., "documents/test.txt")
     strcpy(msg.username, username);
     
     send_message(ss_sock, &msg);
@@ -188,7 +227,7 @@ void cmd_write(const char* filename, int sentence_num) {
     // Send write request
     memset(&msg, 0, sizeof(msg));
     msg.type = MSG_WRITE_FILE;
-    strcpy(msg.filename, filename);
+    strcpy(msg.filename, filename); // filename now includes path (e.g., "documents/test.txt")
     strcpy(msg.username, username);
     msg.flags = sentence_num;
     
@@ -315,7 +354,7 @@ void cmd_stream(const char* filename) {
     // Send stream request
     memset(&msg, 0, sizeof(msg));
     msg.type = MSG_STREAM_FILE;
-    strcpy(msg.filename, filename);
+    strcpy(msg.filename, filename); // filename now includes path (e.g., "documents/test.txt")
     strcpy(msg.username, username);
     
     send_message(ss_sock, &msg);
@@ -444,7 +483,7 @@ void cmd_undo(const char* filename) {
     // Send undo request
     memset(&msg, 0, sizeof(msg));
     msg.type = MSG_UNDO_FILE;
-    strcpy(msg.filename, filename);
+    strcpy(msg.filename, filename); // filename now includes path (e.g., "documents/test.txt")
     strcpy(msg.username, username);
     
     send_message(ss_sock, &msg);
@@ -457,6 +496,253 @@ void cmd_undo(const char* filename) {
     }
     
     close(ss_sock);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// BONUS FEATURES
+// ═══════════════════════════════════════════════════════════════════
+
+// CREATEFOLDER command
+void cmd_create_folder(const char* foldername) {
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_CREATE_FOLDER;
+    strcpy(msg.username, username);
+    strcpy(msg.folder_path, foldername);
+    
+    send_message(nm_sock, &msg);
+    
+    Message response;
+    if (receive_message(nm_sock, &response) == 0) {
+        printf("%s\n", response.data);
+    } else {
+        printf("ERROR: Communication failed\n");
+    }
+}
+
+// MOVE command
+void cmd_move_file(const char* filename, const char* foldername) {
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_MOVE_FILE;
+    strcpy(msg.username, username);
+    strcpy(msg.filename, filename);
+    strcpy(msg.folder_path, foldername);
+    
+    send_message(nm_sock, &msg);
+    
+    Message response;
+    if (receive_message(nm_sock, &response) == 0) {
+        printf("%s\n", response.data);
+    } else {
+        printf("ERROR: Communication failed\n");
+    }
+}
+
+// VIEWFOLDER command
+void cmd_view_folder(const char* foldername) {
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_VIEW_FOLDER;
+    strcpy(msg.username, username);
+    strcpy(msg.folder_path, foldername);
+    
+    send_message(nm_sock, &msg);
+    
+    Message response;
+    if (receive_message(nm_sock, &response) == 0) {
+        printf("%s", response.data);
+    } else {
+        printf("ERROR: Communication failed\n");
+    }
+}
+
+// CHECKPOINT command
+void cmd_checkpoint(const char* filename, const char* tag) {
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_CHECKPOINT;
+    strcpy(msg.username, username);
+    strcpy(msg.filename, filename);
+    strcpy(msg.checkpoint_tag, tag);
+    
+    send_message(nm_sock, &msg);
+    
+    Message response;
+    if (receive_message(nm_sock, &response) == 0) {
+        printf("%s\n", response.data);
+    } else {
+        printf("ERROR: Communication failed\n");
+    }
+}
+
+// VIEWCHECKPOINT command
+void cmd_view_checkpoint(const char* filename, const char* tag) {
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_VIEW_CHECKPOINT;
+    strcpy(msg.username, username);
+    strcpy(msg.filename, filename);
+    strcpy(msg.checkpoint_tag, tag);
+    
+    send_message(nm_sock, &msg);
+    
+    Message response;
+    if (receive_message(nm_sock, &response) == 0) {
+        if (response.error_code == ERR_SUCCESS) {
+            printf("─── Checkpoint '%s' of '%s' ───\n%s\n", tag, filename, response.data);
+        } else {
+            printf("ERROR: %s\n", response.data);
+        }
+    } else {
+        printf("ERROR: Communication failed\n");
+    }
+}
+
+// REVERT command
+void cmd_revert_checkpoint(const char* filename, const char* tag) {
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_REVERT_CHECKPOINT;
+    strcpy(msg.username, username);
+    strcpy(msg.filename, filename);
+    strcpy(msg.checkpoint_tag, tag);
+    
+    send_message(nm_sock, &msg);
+    
+    Message response;
+    if (receive_message(nm_sock, &response) == 0) {
+        printf("%s\n", response.data);
+    } else {
+        printf("ERROR: Communication failed\n");
+    }
+}
+
+// LISTCHECKPOINTS command
+void cmd_list_checkpoints(const char* filename) {
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_LIST_CHECKPOINTS;
+    strcpy(msg.username, username);
+    strcpy(msg.filename, filename);
+    
+    send_message(nm_sock, &msg);
+    
+    Message response;
+    if (receive_message(nm_sock, &response) == 0) {
+        printf("%s", response.data);
+    } else {
+        printf("ERROR: Communication failed\n");
+    }
+}
+
+// REQUESTACCESS command
+void cmd_request_access(const char* filename, const char* flag) {
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_REQUEST_ACCESS;
+    strcpy(msg.username, username);
+    strcpy(msg.filename, filename);
+    msg.flags = (strcmp(flag, "-R") == 0) ? ACCESS_READ : ACCESS_WRITE;
+    
+    send_message(nm_sock, &msg);
+    
+    Message response;
+    if (receive_message(nm_sock, &response) == 0) {
+        printf("%s\n", response.data);
+    } else {
+        printf("ERROR: Communication failed\n");
+    }
+}
+
+// VIEWREQUESTS command
+void cmd_view_requests() {
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_VIEW_REQUESTS;
+    strcpy(msg.username, username);
+    
+    send_message(nm_sock, &msg);
+    
+    Message response;
+    if (receive_message(nm_sock, &response) == 0) {
+        printf("%s", response.data);
+    } else {
+        printf("ERROR: Communication failed\n");
+    }
+}
+
+// APPROVEREQUEST command
+void cmd_approve_request(const char* requester, const char* filename) {
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_APPROVE_REQUEST;
+    strcpy(msg.username, username);
+    strcpy(msg.target_user, requester);
+    strcpy(msg.filename, filename);
+    
+    send_message(nm_sock, &msg);
+    
+    Message response;
+    if (receive_message(nm_sock, &response) == 0) {
+        printf("%s\n", response.data);
+    } else {
+        printf("ERROR: Communication failed\n");
+    }
+}
+
+// DENYREQUEST command
+void cmd_deny_request(const char* requester, const char* filename) {
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_DENY_REQUEST;
+    strcpy(msg.username, username);
+    strcpy(msg.target_user, requester);
+    strcpy(msg.filename, filename);
+    
+    send_message(nm_sock, &msg);
+    
+    Message response;
+    if (receive_message(nm_sock, &response) == 0) {
+        printf("%s\n", response.data);
+    } else {
+        printf("ERROR: Communication failed\n");
+    }
+}
+
+// SEARCH command
+void cmd_search(const char* pattern) {
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_SEARCH_FILE;
+    strcpy(msg.username, username);
+    strcpy(msg.data, pattern);
+    
+    send_message(nm_sock, &msg);
+    
+    Message response;
+    if (receive_message(nm_sock, &response) == 0) {
+        printf("%s", response.data);
+    } else {
+        printf("ERROR: Communication failed\n");
+    }
+}
+
+// METRICS command
+void cmd_metrics() {
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_GET_METRICS;
+    strcpy(msg.username, username);
+    
+    send_message(nm_sock, &msg);
+    
+    Message response;
+    if (receive_message(nm_sock, &response) == 0) {
+        printf("%s", response.data);
+    } else {
+        printf("ERROR: Communication failed\n");
+    }
 }
 
 // Handle command
@@ -571,6 +857,113 @@ void handle_command(const char* command) {
         printf("Goodbye!\n");
         close(nm_sock);
         exit(0);
+    }
+    // Bonus: Folder commands
+    else if (strcasecmp(token, "CREATEFOLDER") == 0) {
+        char* foldername = strtok(NULL, " ");
+        if (foldername) {
+            cmd_create_folder(foldername);
+        } else {
+            printf("ERROR: Usage: CREATEFOLDER <foldername>\n");
+        }
+    }
+    else if (strcasecmp(token, "MOVE") == 0) {
+        char* filename = strtok(NULL, " ");
+        char* foldername = strtok(NULL, " ");
+        if (filename && foldername) {
+            cmd_move_file(filename, foldername);
+        } else {
+            printf("ERROR: Usage: MOVE <filename> <foldername>\n");
+        }
+    }
+    else if (strcasecmp(token, "VIEWFOLDER") == 0) {
+        char* foldername = strtok(NULL, " ");
+        if (foldername) {
+            cmd_view_folder(foldername);
+        } else {
+            printf("ERROR: Usage: VIEWFOLDER <foldername>\n");
+        }
+    }
+    // Bonus: Checkpoint commands
+    else if (strcasecmp(token, "CHECKPOINT") == 0) {
+        char* filename = strtok(NULL, " ");
+        char* tag = strtok(NULL, " ");
+        if (filename && tag) {
+            cmd_checkpoint(filename, tag);
+        } else {
+            printf("ERROR: Usage: CHECKPOINT <filename> <tag>\n");
+        }
+    }
+    else if (strcasecmp(token, "VIEWCHECKPOINT") == 0) {
+        char* filename = strtok(NULL, " ");
+        char* tag = strtok(NULL, " ");
+        if (filename && tag) {
+            cmd_view_checkpoint(filename, tag);
+        } else {
+            printf("ERROR: Usage: VIEWCHECKPOINT <filename> <tag>\n");
+        }
+    }
+    else if (strcasecmp(token, "REVERT") == 0) {
+        char* filename = strtok(NULL, " ");
+        char* tag = strtok(NULL, " ");
+        if (filename && tag) {
+            cmd_revert_checkpoint(filename, tag);
+        } else {
+            printf("ERROR: Usage: REVERT <filename> <tag>\n");
+        }
+    }
+    else if (strcasecmp(token, "LISTCHECKPOINTS") == 0) {
+        char* filename = strtok(NULL, " ");
+        if (filename) {
+            cmd_list_checkpoints(filename);
+        } else {
+            printf("ERROR: Usage: LISTCHECKPOINTS <filename>\n");
+        }
+    }
+    // Bonus: Access request commands
+    else if (strcasecmp(token, "REQUESTACCESS") == 0) {
+        char* flag = strtok(NULL, " ");
+        char* filename = strtok(NULL, " ");
+        if (flag && filename) {
+            cmd_request_access(filename, flag);
+        } else {
+            printf("ERROR: Usage: REQUESTACCESS -R/-W <filename>\n");
+        }
+    }
+    else if (strcasecmp(token, "VIEWREQUESTS") == 0) {
+        cmd_view_requests();
+    }
+    else if (strcasecmp(token, "APPROVEREQUEST") == 0) {
+        char* requester = strtok(NULL, " ");
+        char* filename = strtok(NULL, " ");
+        if (requester && filename) {
+            cmd_approve_request(requester, filename);
+        } else {
+            printf("ERROR: Usage: APPROVEREQUEST <username> <filename>\n");
+        }
+    }
+    else if (strcasecmp(token, "DENYREQUEST") == 0) {
+        char* requester = strtok(NULL, " ");
+        char* filename = strtok(NULL, " ");
+        if (requester && filename) {
+            cmd_deny_request(requester, filename);
+        } else {
+            printf("ERROR: Usage: DENYREQUEST <username> <filename>\n");
+        }
+    }
+    // Bonus: Unique features
+    else if (strcasecmp(token, "SEARCH") == 0) {
+        char* pattern = strtok(NULL, "");
+        if (pattern) {
+            // Trim leading spaces
+            while (*pattern == ' ') pattern++;
+            cmd_search(pattern);
+        } else {
+            printf("ERROR: Usage: SEARCH <pattern>\n");
+        }
+    }
+    else if (strcasecmp(token, "METRICS") == 0) {
+        cmd_metrics();
     }
     else {
         printf("ERROR: Unknown command. Type HELP for list of commands.\n");
