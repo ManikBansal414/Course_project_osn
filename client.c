@@ -245,7 +245,7 @@ void cmd_write(const char* filename, int sentence_num) {
     // Read word updates from user
     char line[MAX_BUFFER_SIZE];
     while (1) {
-        printf("Client: ");
+        printf("%s: ", username);
         fflush(stdout);
         
         if (!fgets(line, sizeof(line), stdin)) {
@@ -998,7 +998,7 @@ int main() {
     // Command loop
     char command[MAX_BUFFER_SIZE];
     while (1) {
-        printf("Client> ");
+        printf("%s> ", username);
         fflush(stdout);
         
         if (!fgets(command, sizeof(command), stdin)) {
