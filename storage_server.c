@@ -306,6 +306,51 @@ void save_for_undo(const char* filename) {
     save_for_undo_with_folder("", filename);
 }
 
+// Asynchronously replicate file to replica storage server
+void replicate_to_secondary(const char* filename, const char* replica_ip, int replica_port) {
+    // This should be called in a separate thread for async replication
+    char file_path[512];
+    snprintf(file_path, sizeof(file_path), "%s/%s", STORAGE_DIR, filename);
+    
+    // Read file content
+    char buffer[MAX_BUFFER_SIZE];
+    FILE* f = fopen(file_path, "r");
+    if (!f) {
+        log_message("SS", "Failed to read file for replication: %s", filename);
+        return;
+    }
+    
+    size_t content_len = fread(buffer, 1, sizeof(buffer) - 1, f);
+    buffer[content_len] = '\0';
+    fclose(f);
+    
+    // Connect to replica server
+    int replica_sock = connect_to_server(replica_ip, replica_port);
+    if (replica_sock < 0) {
+        log_message("SS", "Failed to connect to replica server for %s", filename);
+        return;
+    }
+    
+    // Send replication message
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_SS_REPLICATE;
+    strcpy(msg.filename, filename);
+    memcpy(msg.data, buffer, content_len);
+    msg.data_len = content_len;
+    
+    send_message(replica_sock, &msg);
+    
+    Message response;
+    if (receive_message(replica_sock, &response) == 0 && response.error_code == ERR_SUCCESS) {
+        log_message("SS", "Successfully replicated %s to secondary", filename);
+    } else {
+        log_message("SS", "Failed to replicate %s to secondary", filename);
+    }
+    
+    close(replica_sock);
+}
+
 // Get sentence lock
 SentenceLock* get_sentence_lock(const char* filename, int sentence_index) {
     pthread_mutex_lock(&locks_mutex);
@@ -956,6 +1001,38 @@ void* handle_nm_request(void* arg) {
                     response.error_code = ERR_SUCCESS;
                     log_message("SS", "Checkpoints listed for %s: %d found", msg.filename, count);
                 }
+                break;
+            }
+            
+            case MSG_SS_REPLICATE: {
+                // Replicate file content from primary to this server
+                char file_path[512];
+                snprintf(file_path, sizeof(file_path), "%s/%s", STORAGE_DIR, msg.filename);
+                
+                // Ensure parent directory exists
+                char* last_slash = strrchr(file_path, '/');
+                if (last_slash) {
+                    char parent_dir[512];
+                    strncpy(parent_dir, file_path, last_slash - file_path);
+                    parent_dir[last_slash - file_path] = '\0';
+                    create_folder_recursive(parent_dir);
+                }
+                
+                // Write replicated content to file
+                FILE* f = fopen(file_path, "w");
+                if (!f) {
+                    response.error_code = ERR_SERVER_ERROR;
+                    strcpy(response.data, "ERROR: Cannot write replica file");
+                    log_message("SS", "Failed to write replica for %s", msg.filename);
+                    break;
+                }
+                
+                fwrite(msg.data, 1, msg.data_len, f);
+                fclose(f);
+                
+                response.error_code = ERR_SUCCESS;
+                sprintf(response.data, "✓ Replica updated for '%s'", msg.filename);
+                log_message("SS", "Replica updated: %s (%d bytes)", msg.filename, msg.data_len);
                 break;
             }
                 

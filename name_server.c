@@ -580,10 +580,16 @@ void handle_create(int client_sock, Message* msg) {
     
     // Find available storage server
     int ss_index = -1;
+    int replica_ss_index = -1;
+    
     for (int i = 0; i < num_storage_servers; i++) {
         if (storage_servers[i].is_active) {
-            ss_index = i;
-            break;
+            if (ss_index < 0) {
+                ss_index = i; // Primary server
+            } else if (replica_ss_index < 0) {
+                replica_ss_index = i; // Replica server
+                break;
+            }
         }
     }
     
@@ -632,14 +638,42 @@ void handle_create(int client_sock, Message* msg) {
             metadata.word_count = 0;
             metadata.char_count = 0;
             metadata.ss_index = ss_index;
-            metadata.replica_ss_index = -1; // No replica initially
+            metadata.replica_ss_index = replica_ss_index; // Assign replica if available
             
             add_file(&metadata);
+            
+            // If replica server exists, create file there too
+            if (replica_ss_index >= 0) {
+                int replica_sock = connect_to_server(storage_servers[replica_ss_index].ip,
+                                                     storage_servers[replica_ss_index].nm_port);
+                if (replica_sock >= 0) {
+                    Message replica_msg;
+                    memset(&replica_msg, 0, sizeof(replica_msg));
+                    replica_msg.type = MSG_SS_CREATE;
+                    strcpy(replica_msg.filename, msg->filename);
+                    strcpy(replica_msg.username, msg->username);
+                    send_message(replica_sock, &replica_msg);
+                    
+                    Message replica_response;
+                    receive_message(replica_sock, &replica_response);
+                    close(replica_sock);
+                    
+                    if (replica_response.error_code == ERR_SUCCESS) {
+                        log_message("NM", "Replica created for %s on SS %d", msg->filename, replica_ss_index);
+                    }
+                }
+            }
+            
             save_metadata();
             pthread_mutex_unlock(&data_mutex);
             
             response.error_code = ERR_SUCCESS;
-            strcpy(response.data, "File Created Successfully!");
+            if (replica_ss_index >= 0) {
+                sprintf(response.data, "File Created Successfully! (Primary: SS%d, Replica: SS%d)", 
+                        ss_index, replica_ss_index);
+            } else {
+                strcpy(response.data, "File Created Successfully!");
+            }
         } else {
             response.error_code = ss_response.error_code;
             strcpy(response.data, ss_response.data);
@@ -1379,6 +1413,275 @@ void handle_list_checkpoints(int client_sock, Message* msg) {
     log_to_file("LISTCHECKPOINTS: %s by %s", msg->filename, msg->username);
 }
 
+// Handle REQUEST ACCESS command
+void handle_request_access(int client_sock, Message* msg) {
+    pthread_mutex_lock(&data_mutex);
+    
+    FileNode* file = find_file(msg->filename);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_RESPONSE;
+    
+    if (!file) {
+        response.error_code = ERR_FILE_NOT_FOUND;
+        sprintf(response.data, "ERROR: File '%s' not found", msg->filename);
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Check if user already has access
+    int current_access = get_user_access(file, msg->username);
+    if (current_access & msg->flags) {
+        response.error_code = ERR_INVALID_COMMAND;
+        strcpy(response.data, "ERROR: You already have the requested access");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Check if user is the owner
+    if (strcmp(file->metadata.owner, msg->username) == 0) {
+        response.error_code = ERR_INVALID_COMMAND;
+        strcpy(response.data, "ERROR: You are the owner - you have full access");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Check if request already exists
+    for (int i = 0; i < num_access_requests; i++) {
+        if (strcmp(access_requests[i].filename, msg->filename) == 0 &&
+            strcmp(access_requests[i].requester, msg->username) == 0) {
+            response.error_code = ERR_INVALID_COMMAND;
+            strcpy(response.data, "ERROR: You already have a pending request for this file");
+            pthread_mutex_unlock(&data_mutex);
+            send_message(client_sock, &response);
+            return;
+        }
+    }
+    
+    // Add new access request
+    if (num_access_requests >= max_access_requests) {
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "ERROR: Too many pending access requests");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    strcpy(access_requests[num_access_requests].filename, msg->filename);
+    strcpy(access_requests[num_access_requests].requester, msg->username);
+    access_requests[num_access_requests].requested_rights = msg->flags;
+    time(&access_requests[num_access_requests].request_time);
+    num_access_requests++;
+    
+    response.error_code = ERR_SUCCESS;
+    sprintf(response.data, "✓ Access request sent to owner of '%s' (%s)", 
+            msg->filename, file->metadata.owner);
+    
+    pthread_mutex_unlock(&data_mutex);
+    send_message(client_sock, &response);
+    log_to_file("REQUEST ACCESS: %s for %s by %s (rights=%d)", 
+                msg->filename, file->metadata.owner, msg->username, msg->flags);
+}
+
+// Handle VIEW REQUESTS command
+void handle_view_requests(int client_sock, Message* msg) {
+    pthread_mutex_lock(&data_mutex);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_RESPONSE;
+    response.error_code = ERR_SUCCESS;
+    
+    char buffer[MAX_BUFFER_SIZE];
+    int offset = 0;
+    
+    offset += sprintf(buffer + offset, "─── Pending Access Requests ───\n");
+    
+    int count = 0;
+    for (int i = 0; i < num_access_requests && offset < MAX_BUFFER_SIZE - 256; i++) {
+        // Find the file to check ownership
+        FileNode* file = find_file(access_requests[i].filename);
+        if (file && strcmp(file->metadata.owner, msg->username) == 0) {
+            char time_str[64];
+            format_time(access_requests[i].request_time, time_str, sizeof(time_str));
+            const char* access_type = (access_requests[i].requested_rights == ACCESS_READ) ? "READ" : "WRITE";
+            
+            offset += sprintf(buffer + offset, "  • %s requests %s access to '%s' (%s)\n",
+                            access_requests[i].requester, access_type, 
+                            access_requests[i].filename, time_str);
+            count++;
+        }
+    }
+    
+    if (count == 0) {
+        offset += sprintf(buffer + offset, "(no pending requests)\n");
+    } else {
+        offset += sprintf(buffer + offset, "\nUse: APPROVEREQUEST <requester> <filename>\n");
+        offset += sprintf(buffer + offset, "     DENYREQUEST <requester> <filename>\n");
+    }
+    
+    strcpy(response.data, buffer);
+    
+    pthread_mutex_unlock(&data_mutex);
+    send_message(client_sock, &response);
+    log_to_file("VIEWREQUESTS: by %s (%d requests)", msg->username, count);
+}
+
+// Handle APPROVE REQUEST command
+void handle_approve_request(int client_sock, Message* msg) {
+    pthread_mutex_lock(&data_mutex);
+    
+    FileNode* file = find_file(msg->filename);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_RESPONSE;
+    
+    if (!file) {
+        response.error_code = ERR_FILE_NOT_FOUND;
+        sprintf(response.data, "ERROR: File '%s' not found", msg->filename);
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Check if user is the owner
+    if (strcmp(file->metadata.owner, msg->username) != 0) {
+        response.error_code = ERR_UNAUTHORIZED;
+        strcpy(response.data, "ERROR: Only the file owner can approve access requests");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Find the access request
+    int request_index = -1;
+    for (int i = 0; i < num_access_requests; i++) {
+        if (strcmp(access_requests[i].filename, msg->filename) == 0 &&
+            strcmp(access_requests[i].requester, msg->target_user) == 0) {
+            request_index = i;
+            break;
+        }
+    }
+    
+    if (request_index < 0) {
+        response.error_code = ERR_INVALID_COMMAND;
+        sprintf(response.data, "ERROR: No pending request from '%s' for '%s'", 
+                msg->target_user, msg->filename);
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Grant the requested access
+    int requested_rights = access_requests[request_index].requested_rights;
+    
+    // Check if user already has access in the access list
+    int user_found = 0;
+    for (int i = 0; i < file->access_count; i++) {
+        if (strcmp(file->access_list[i].username, msg->target_user) == 0) {
+            // User exists, add the requested rights
+            file->access_list[i].access_rights |= requested_rights;
+            user_found = 1;
+            break;
+        }
+    }
+    
+    // If user not in access list, add them
+    if (!user_found) {
+        file->access_list = (UserAccess*)realloc(file->access_list, 
+                                                 (file->access_count + 1) * sizeof(UserAccess));
+        strcpy(file->access_list[file->access_count].username, msg->target_user);
+        file->access_list[file->access_count].access_rights = requested_rights;
+        file->access_count++;
+    }
+    
+    // Remove the request from the queue
+    for (int i = request_index; i < num_access_requests - 1; i++) {
+        access_requests[i] = access_requests[i + 1];
+    }
+    num_access_requests--;
+    
+    // Save metadata
+    save_metadata();
+    
+    response.error_code = ERR_SUCCESS;
+    const char* access_type = (requested_rights == ACCESS_READ) ? "READ" : "WRITE";
+    sprintf(response.data, "✓ Granted %s access to '%s' for user '%s'", 
+            access_type, msg->filename, msg->target_user);
+    
+    pthread_mutex_unlock(&data_mutex);
+    send_message(client_sock, &response);
+    log_to_file("APPROVE: %s granted %s access to %s for %s", 
+                msg->username, access_type, msg->filename, msg->target_user);
+}
+
+// Handle DENY REQUEST command
+void handle_deny_request(int client_sock, Message* msg) {
+    pthread_mutex_lock(&data_mutex);
+    
+    FileNode* file = find_file(msg->filename);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_RESPONSE;
+    
+    if (!file) {
+        response.error_code = ERR_FILE_NOT_FOUND;
+        sprintf(response.data, "ERROR: File '%s' not found", msg->filename);
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Check if user is the owner
+    if (strcmp(file->metadata.owner, msg->username) != 0) {
+        response.error_code = ERR_UNAUTHORIZED;
+        strcpy(response.data, "ERROR: Only the file owner can deny access requests");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Find and remove the access request
+    int request_index = -1;
+    for (int i = 0; i < num_access_requests; i++) {
+        if (strcmp(access_requests[i].filename, msg->filename) == 0 &&
+            strcmp(access_requests[i].requester, msg->target_user) == 0) {
+            request_index = i;
+            break;
+        }
+    }
+    
+    if (request_index < 0) {
+        response.error_code = ERR_INVALID_COMMAND;
+        sprintf(response.data, "ERROR: No pending request from '%s' for '%s'", 
+                msg->target_user, msg->filename);
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    // Remove the request from the queue
+    for (int i = request_index; i < num_access_requests - 1; i++) {
+        access_requests[i] = access_requests[i + 1];
+    }
+    num_access_requests--;
+    
+    response.error_code = ERR_SUCCESS;
+    sprintf(response.data, "✓ Access request from '%s' for '%s' denied", 
+            msg->target_user, msg->filename);
+    
+    pthread_mutex_unlock(&data_mutex);
+    send_message(client_sock, &response);
+    log_to_file("DENY: %s denied access to %s for %s", 
+                msg->username, msg->filename, msg->target_user);
+}
+
 // Helper functions for metrics
 int count_files() {
     int count = 0;
@@ -1614,9 +1917,21 @@ void* handle_client(void* arg) {
                 handle_list_checkpoints(client_sock, &msg);
                 break;
             case MSG_REQUEST_ACCESS:
+                handle_request_access(client_sock, &msg);
+                break;
+                
             case MSG_VIEW_REQUESTS:
+                handle_view_requests(client_sock, &msg);
+                break;
+                
             case MSG_APPROVE_REQUEST:
+                handle_approve_request(client_sock, &msg);
+                break;
+                
             case MSG_DENY_REQUEST:
+                handle_deny_request(client_sock, &msg);
+                break;
+                
             case MSG_SEARCH_FILE:
             case MSG_GET_METRICS:
                 {

@@ -44,7 +44,7 @@ client: $(CLIENT_OBJ) $(COMMON_OBJ)
 clean:
 	rm -f $(TARGETS) *.o
 	rm -f nm_log.txt ss_log.txt nm_metadata.dat
-	rm -rf storage undo
+	rm -rf storage undo checkpoints
 	@echo "✓ Cleaned build artifacts"
 
 # Clean everything including logs and data
