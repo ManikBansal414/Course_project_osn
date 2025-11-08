@@ -402,16 +402,16 @@ void handle_read(int sock, Message* msg) {
     log_to_file("READ: %s", msg->filename);
 }
 
-// Handle WRITE request
+// Handle WRITE request - Word-level editing with sentence locking
 void handle_write(int sock, Message* msg) {
     Message response;
     memset(&response, 0, sizeof(response));
     response.type = MSG_RESPONSE;
     
-    // Save for undo - filename now includes path
+    // Save for undo before any modifications
     save_for_undo(msg->filename);
     
-    // Read current content
+    // Read the current file content
     char buffer[MAX_BUFFER_SIZE];
     int n = read_file_content(msg->filename, buffer, sizeof(buffer));
     
@@ -422,184 +422,292 @@ void handle_write(int sock, Message* msg) {
         return;
     }
     
-    // Parse sentences
+    // Parse file content into sentences based on delimiters (. ! ?)
     char sentences[1000][MAX_SENTENCE_LENGTH];
-    int sentence_count;
+    int sentence_count = 0;
     parse_sentences(buffer, sentences, &sentence_count);
     
+    // Get the sentence index to edit from msg->flags
     int sentence_index = msg->flags;
     
-    // Validate sentence index
-    if (sentence_index < 0 || sentence_index > sentence_count) {
-        response.error_code = ERR_INVALID_INDEX;
-        strcpy(response.data, "ERROR: Sentence index out of range");
-        send_message(sock, &response);
-        return;
+    // Special case: Empty file - allow writing to sentence 0
+    if (n == 0 && sentence_index == 0) {
+        // Allow - will create first sentence
+    } else {
+        // Check if file ends with a delimiter (allows adding new sentence)
+        int ends_with_delimiter = 0;
+        if (n > 0) {
+            char last_char = buffer[n - 1];
+            if (last_char == '.' || last_char == '!' || last_char == '?') {
+                ends_with_delimiter = 1;
+            }
+        }
+        
+        // Validate sentence index
+        // Can only be equal to count if file ends with delimiter (allowing new sentence)
+        // Otherwise, must be < count (can only edit existing sentences)
+        int max_allowed_index = ends_with_delimiter ? sentence_count : (sentence_count - 1);
+        if (sentence_index < 0 || sentence_index > max_allowed_index) {
+            response.error_code = ERR_INVALID_INDEX;
+            if (ends_with_delimiter) {
+                sprintf(response.data, "ERROR: Sentence index out of range (0-%d)", sentence_count);
+            } else {
+                sprintf(response.data, "ERROR: Sentence index out of range (0-%d). Last sentence has no delimiter.", sentence_count - 1);
+            }
+            send_message(sock, &response);
+            return;
+        }
     }
     
-    // Get lock
+    // Get or create lock for this specific sentence
     SentenceLock* lock = get_sentence_lock(msg->filename, sentence_index);
     if (!lock) {
         response.error_code = ERR_SERVER_ERROR;
-        strcpy(response.data, "ERROR: Cannot acquire lock");
+        strcpy(response.data, "ERROR: Cannot create sentence lock");
         send_message(sock, &response);
         return;
     }
     
-    // Try to lock
+    // Try to acquire the lock (non-blocking)
     if (pthread_mutex_trylock(&lock->lock) != 0) {
         response.error_code = ERR_SENTENCE_LOCKED;
-        sprintf(response.data, "ERROR: Sentence locked by %s", lock->locked_by);
+        sprintf(response.data, "ERROR: Sentence %d is locked by %s", sentence_index, lock->locked_by);
         send_message(sock, &response);
         return;
     }
     
+    // Mark who locked this sentence
     strcpy(lock->locked_by, msg->username);
     
-    // Send ACK that lock is acquired
+    // Send acknowledgment that lock is acquired
     response.error_code = ERR_SUCCESS;
-    strcpy(response.data, "Lock acquired. Send word updates.");
+    strcpy(response.data, "ACK: Sentence locked. Send word updates, end with ETIRW");
     send_message(sock, &response);
     
-    // Receive word updates until ETIRW
+    // Get the sentence to edit (or create new if at end)
+    char working_sentence[MAX_SENTENCE_LENGTH];
+    if (sentence_index < sentence_count) {
+        strcpy(working_sentence, sentences[sentence_index]);
+    } else {
+        working_sentence[0] = '\0';  // New empty sentence
+        sentence_count = sentence_index + 1;  // Expand sentence array
+    }
+    
+    // Receive word updates in a loop until ETIRW
     while (1) {
         Message update_msg;
         if (receive_message(sock, &update_msg) < 0) {
+            // Connection lost, release lock and exit
             pthread_mutex_unlock(&lock->lock);
             lock->locked_by[0] = '\0';
             return;
         }
         
-        // Check for ETIRW (end of write)
+        // Check for ETIRW (end write marker)
         if (strcmp(update_msg.data, "ETIRW") == 0) {
             break;
         }
         
-        // Parse word index and content
+        // Extract word_index and content from update message
         int word_index = update_msg.word_index;
+        char* new_content = update_msg.data;
         
-        // Get or create sentence
-        char* target_sentence;
-        if (sentence_index >= sentence_count) {
-            // Append new sentence
-            target_sentence = sentences[sentence_count];
-            target_sentence[0] = '\0';
-            sentence_count++;
-        } else {
-            target_sentence = sentences[sentence_index];
-        }
-        
-        // Parse words in sentence using thread-safe strtok_r
+        // Parse working_sentence into words
         char words[1000][MAX_WORD_LENGTH];
         int word_count = 0;
         
-        char* saveptr1;
-        char* token = strtok_r(target_sentence, " ", &saveptr1);
-        while (token && word_count < 1000) {
-            strcpy(words[word_count++], token);
-            token = strtok_r(NULL, " ", &saveptr1);
+        char temp_sentence[MAX_SENTENCE_LENGTH];
+        strcpy(temp_sentence, working_sentence);
+        
+        char* saveptr;
+        char* token = strtok_r(temp_sentence, " ", &saveptr);
+        while (token != NULL && word_count < 1000) {
+            strcpy(words[word_count], token);
+            word_count++;
+            token = strtok_r(NULL, " ", &saveptr);
         }
         
-        // Validate word index
-        if (word_index < 0 || word_index > word_count + 1) {
-            Message error_response;
-            memset(&error_response, 0, sizeof(error_response));
-            error_response.type = MSG_ERROR;
-            error_response.error_code = ERR_INVALID_INDEX;
-            strcpy(error_response.data, "ERROR: Word index out of range");
-            send_message(sock, &error_response);
+        // Validate word_index
+        if (word_index < 0 || word_index > word_count) {
+            Message error_resp;
+            memset(&error_resp, 0, sizeof(error_resp));
+            error_resp.type = MSG_RESPONSE;
+            error_resp.error_code = ERR_INVALID_INDEX;
+            sprintf(error_resp.data, "ERROR: Word index %d out of range (0-%d)", word_index, word_count);
+            send_message(sock, &error_resp);
             continue;
         }
         
-        // Insert content at word index
-        char new_content[MAX_SENTENCE_LENGTH * 10];
-        char* content_tokens[1000];
-        int content_count = 0;
+        // Insert new_content at word_index
+        // Split new_content by spaces to get individual words to insert
+        char content_words[1000][MAX_WORD_LENGTH];
+        int content_word_count = 0;
         
-        // Parse content into tokens using thread-safe strtok_r
         char content_copy[MAX_BUFFER_SIZE];
-        strcpy(content_copy, update_msg.data);
+        strcpy(content_copy, new_content);
+        
         char* saveptr2;
         char* ct = strtok_r(content_copy, " ", &saveptr2);
-        while (ct && content_count < 1000) {
-            content_tokens[content_count++] = strdup(ct);
+        while (ct != NULL && content_word_count < 1000) {
+            strcpy(content_words[content_word_count], ct);
+            content_word_count++;
             ct = strtok_r(NULL, " ", &saveptr2);
         }
         
-        // Rebuild sentence with inserted content
-        int new_word_count = 0;
-        char new_words[2000][MAX_WORD_LENGTH];
+        // Build new sentence: words[0..word_index-1] + content_words + words[word_index..]
+        char new_sentence[MAX_SENTENCE_LENGTH * 2];
+        new_sentence[0] = '\0';
         
-        for (int i = 0; i < word_index && i < word_count; i++) {
-            strcpy(new_words[new_word_count++], words[i]);
+        // Add words before insertion point
+        for (int i = 0; i < word_index; i++) {
+            if (strlen(new_sentence) > 0) strcat(new_sentence, " ");
+            strcat(new_sentence, words[i]);
         }
         
-        for (int i = 0; i < content_count; i++) {
-            strcpy(new_words[new_word_count++], content_tokens[i]);
-            free(content_tokens[i]);
+        // Add new content words
+        for (int i = 0; i < content_word_count; i++) {
+            if (strlen(new_sentence) > 0) strcat(new_sentence, " ");
+            strcat(new_sentence, content_words[i]);
         }
         
+        // Add remaining words after insertion point
         for (int i = word_index; i < word_count; i++) {
-            strcpy(new_words[new_word_count++], words[i]);
+            if (strlen(new_sentence) > 0) strcat(new_sentence, " ");
+            strcat(new_sentence, words[i]);
         }
         
-        // Reconstruct sentence
-        target_sentence[0] = '\0';
-        for (int i = 0; i < new_word_count; i++) {
-            strcat(target_sentence, new_words[i]);
-            if (i < new_word_count - 1) {
-                strcat(target_sentence, " ");
-            }
-        }
+        // Update working_sentence
+        strcpy(working_sentence, new_sentence);
         
-        // Check for sentence delimiters and split if necessary
-        char temp_sentences[100][MAX_SENTENCE_LENGTH];
-        int temp_count = 0;
-        parse_sentences(target_sentence, temp_sentences, &temp_count);
-        
-        if (temp_count > 1) {
-            // Replace current sentence with first split
-            strcpy(sentences[sentence_index], temp_sentences[0]);
-            
-            // Insert remaining splits
-            for (int i = sentence_count - 1; i > sentence_index; i--) {
-                strcpy(sentences[i + temp_count - 1], sentences[i]);
-            }
-            
-            for (int i = 1; i < temp_count; i++) {
-                strcpy(sentences[sentence_index + i], temp_sentences[i]);
-            }
-            
-            sentence_count += temp_count - 1;
-        } else {
-            strcpy(sentences[sentence_index], target_sentence);
-        }
-        
-        // Send ACK
+        // Send ACK for this word update
         Message ack;
         memset(&ack, 0, sizeof(ack));
-        ack.type = MSG_ACK;
+        ack.type = MSG_RESPONSE;
         ack.error_code = ERR_SUCCESS;
+        strcpy(ack.data, "ACK");
         send_message(sock, &ack);
     }
     
-    // Reconstruct and save file
-    char final_content[MAX_BUFFER_SIZE];
-    reconstruct_file(sentences, sentence_count, final_content);
-    write_file_content(msg->filename, final_content); // filename includes path
+    // After ETIRW, check for sentence delimiters and split if needed
+    char split_sentences[100][MAX_SENTENCE_LENGTH];
+    int split_count = 0;
+    parse_sentences(working_sentence, split_sentences, &split_count);
     
-    // Release lock
+    // CRITICAL: Re-read the file to get the latest content from other concurrent writers
+    // This ensures we merge our changes with any updates made by other clients
+    char fresh_buffer[MAX_BUFFER_SIZE];
+    int fresh_n = read_file_content(msg->filename, fresh_buffer, sizeof(fresh_buffer));
+    
+    // Parse the latest file content into sentences
+    // Use heap allocation to avoid stack overflow
+    char (*fresh_sentences)[MAX_SENTENCE_LENGTH] = malloc(1000 * sizeof(char[MAX_SENTENCE_LENGTH]));
+    if (!fresh_sentences) {
+        pthread_mutex_unlock(&lock->lock);
+        lock->locked_by[0] = '\0';
+        
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "ERROR: Memory allocation failed");
+        send_message(sock, &response);
+        return;
+    }
+    
+    int fresh_sentence_count = 0;
+    if (fresh_n >= 0) {
+        parse_sentences(fresh_buffer, fresh_sentences, &fresh_sentence_count);
+    }
+    
+    // Now merge: replace the sentence at our index with our edited version
+    // Handle sentence splitting if delimiters were added
+    if (split_count > 1) {
+        // Our edit created multiple sentences, need to insert them
+        
+        // Shift sentences after sentence_index to make room
+        int shift_amount = split_count - 1;
+        for (int i = fresh_sentence_count - 1; i > sentence_index; i--) {
+            if (i + shift_amount < 1000) {
+                strcpy(fresh_sentences[i + shift_amount], fresh_sentences[i]);
+            }
+        }
+        
+        // Insert all our split sentences
+        for (int i = 0; i < split_count && (sentence_index + i) < 1000; i++) {
+            strcpy(fresh_sentences[sentence_index + i], split_sentences[i]);
+        }
+        
+        fresh_sentence_count += shift_amount;
+    } else if (split_count == 1) {
+        // No split, just replace the sentence at our index
+        if (sentence_index < fresh_sentence_count) {
+            strcpy(fresh_sentences[sentence_index], split_sentences[0]);
+        } else {
+            // Sentence was added at the end
+            strcpy(fresh_sentences[sentence_index], split_sentences[0]);
+            fresh_sentence_count = sentence_index + 1;
+        }
+    } else {
+        // Empty sentence or no delimiters, just update
+        if (sentence_index < fresh_sentence_count) {
+            strcpy(fresh_sentences[sentence_index], working_sentence);
+        } else {
+            strcpy(fresh_sentences[sentence_index], working_sentence);
+            fresh_sentence_count = sentence_index + 1;
+        }
+    }
+    
+    // Use temporary swap file approach for concurrent write safety
+    char temp_filepath[512];
+    snprintf(temp_filepath, sizeof(temp_filepath), "%s/%s.tmp", STORAGE_DIR, msg->filename);
+    
+    // Reconstruct full file content from the merged sentences
+    char final_content[MAX_BUFFER_SIZE];
+    reconstruct_file(fresh_sentences, fresh_sentence_count, final_content);
+    
+    // Free the heap-allocated array
+    free(fresh_sentences);
+    
+    // Write to temp file first
+    FILE* temp_fp = fopen(temp_filepath, "w");
+    if (!temp_fp) {
+        pthread_mutex_unlock(&lock->lock);
+        lock->locked_by[0] = '\0';
+        
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "ERROR: Cannot write to temp file");
+        send_message(sock, &response);
+        return;
+    }
+    
+    fprintf(temp_fp, "%s", final_content);
+    fclose(temp_fp);
+    
+    // Atomically move temp file to actual file
+    char actual_filepath[512];
+    snprintf(actual_filepath, sizeof(actual_filepath), "%s/%s", STORAGE_DIR, msg->filename);
+    
+    if (rename(temp_filepath, actual_filepath) != 0) {
+        unlink(temp_filepath);  // Clean up temp file
+        pthread_mutex_unlock(&lock->lock);
+        lock->locked_by[0] = '\0';
+        
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "ERROR: Cannot save file");
+        send_message(sock, &response);
+        return;
+    }
+    
+    // Release the sentence lock
     pthread_mutex_unlock(&lock->lock);
     lock->locked_by[0] = '\0';
     
-    // Send final response
+    // Send success response
     memset(&response, 0, sizeof(response));
     response.type = MSG_RESPONSE;
     response.error_code = ERR_SUCCESS;
-    strcpy(response.data, "Write Successful!");
+    sprintf(response.data, "Write Successful! Sentence %d updated.", sentence_index);
     send_message(sock, &response);
     
-    log_to_file("WRITE: %s by %s, sentence %d", msg->filename, msg->username, sentence_index);
+    log_to_file("WRITE: %s by %s, sentence %d (%d total sentences)", 
+                msg->filename, msg->username, sentence_index, fresh_sentence_count);
 }
 
 // Handle STREAM request
