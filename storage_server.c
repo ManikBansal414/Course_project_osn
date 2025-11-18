@@ -3,8 +3,9 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
-#define STORAGE_DIR "./storage"
-#define UNDO_DIR "./undo"
+// Dynamic storage directories (set based on port number)
+char STORAGE_DIR[256] = "./storage";
+char UNDO_DIR[256] = "./undo";
 
 typedef struct {
     char filename[MAX_FILENAME];
@@ -44,6 +45,9 @@ void create_file(const char* filename, const char* owner);
 void delete_file(const char* filename);
 void save_for_undo(const char* filename);
 void log_to_file(const char* format, ...);
+void trigger_replication(const char* filename);
+void* async_replicate_thread(void* arg);
+void handle_replicate_from_primary(int nm_sock, Message* msg);
 
 // Logging
 void log_to_file(const char* format, ...) {
@@ -105,6 +109,7 @@ int parse_sentences(const char* content, char sentences[][MAX_SENTENCE_LENGTH], 
     int start = 0;
     
     for (int i = 0; i < len && *count < 1000; i++) {
+        // Check if current character is a delimiter
         if (content[i] == '.' || content[i] == '!' || content[i] == '?') {
             int sentence_len = i - start + 1;
             if (sentence_len > 0 && sentence_len < MAX_SENTENCE_LENGTH) {
@@ -118,10 +123,14 @@ int parse_sentences(const char* content, char sentences[][MAX_SENTENCE_LENGTH], 
             while (start < len && content[start] == ' ') {
                 start++;
             }
+            
+            // IMPORTANT: If the next character after delimiter is NOT a space,
+            // it means delimiter was attached to a word (like "bye.hello")
+            // The sentence break still happens here - next content starts new sentence
         }
     }
     
-    // Handle last sentence without delimiter
+    // Handle last sentence without delimiter (or remaining content after last delimiter)
     if (start < len) {
         int sentence_len = len - start;
         if (sentence_len > 0 && sentence_len < MAX_SENTENCE_LENGTH) {
@@ -415,6 +424,135 @@ SentenceLock* get_sentence_lock(const char* filename, int sentence_index) {
     return NULL;
 }
 
+// Trigger replication asynchronously after write
+void trigger_replication(const char* filename) {
+    printf("[DEBUG] trigger_replication() called for: %s\n", filename);
+    fflush(stdout);
+    
+    char* filename_copy = strdup(filename);
+    if (!filename_copy) {
+        printf("[DEBUG] strdup failed!\n");
+        fflush(stdout);
+        return;
+    }
+    
+    pthread_t repl_thread;
+    if (pthread_create(&repl_thread, NULL, async_replicate_thread, filename_copy) == 0) {
+        pthread_detach(repl_thread);
+        printf("[DEBUG] ✅ Replication thread created for: %s\n", filename);
+        fflush(stdout);
+        log_message("SS", "🔄 Triggered async replication for %s", filename);
+    } else {
+        free(filename_copy);
+        printf("[DEBUG] ❌ pthread_create failed for: %s\n", filename);
+        fflush(stdout);
+        log_message("SS", "⚠️ Failed to create replication thread for %s", filename);
+    }
+}
+
+// Async thread to request replication from Name Server
+void* async_replicate_thread(void* arg) {
+    char* filename = (char*)arg;
+    
+    printf("[DEBUG] async_replicate_thread started for: %s\n", filename);
+    printf("[DEBUG] Connecting to Name Server at %s:%d\n", nm_ip, nm_port);
+    fflush(stdout);
+    
+    // Connect to Name Server
+    int nm_sock = connect_to_server(nm_ip, nm_port);
+    if (nm_sock < 0) {
+        printf("[DEBUG] ❌ Failed to connect to NM for replication\n");
+        fflush(stdout);
+        log_message("SS", "Failed to connect to NM for replication of %s", filename);
+        free(filename);
+        return NULL;
+    }
+    
+    printf("[DEBUG] ✅ Connected to Name Server, sending MSG_SS_REPLICATE\n");
+    fflush(stdout);
+    
+    // Send replication request
+    Message msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = MSG_SS_REPLICATE;
+    strcpy(msg.filename, filename);
+    strcpy(msg.ss_ip, my_ip);
+    msg.ss_port = nm_listen_port;
+    
+    send_message(nm_sock, &msg);
+    
+    // Wait for acknowledgment
+    Message response;
+    if (receive_message(nm_sock, &response) == 0) {
+        if (response.error_code == ERR_SUCCESS) {
+            log_message("SS", "✅ Replication request for '%s' acknowledged", filename);
+        } else {
+            log_message("SS", "⚠️ Replication request for '%s' failed: %s", filename, response.data);
+        }
+    }
+    
+    close(nm_sock);
+    free(filename);
+    return NULL;
+}
+
+// Handle replication request from Name Server (this is the SECONDARY receiving the request)
+void handle_replicate_from_primary(int nm_sock, Message* msg) {
+    log_message("SS", "🔄 Replication request for '%s' from primary at %s:%d", 
+               msg->filename, msg->ss_ip, msg->ss_port);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_ACK;
+    
+    // Connect to primary storage server to get file content
+    int primary_sock = connect_to_server(msg->ss_ip, msg->ss_port);
+    if (primary_sock < 0) {
+        response.error_code = ERR_CONNECTION_FAILED;
+        strcpy(response.data, "Cannot connect to primary server");
+        send_message(nm_sock, &response);
+        log_message("SS", "❌ Failed to connect to primary %s:%d", msg->ss_ip, msg->ss_port);
+        return;
+    }
+    
+    // Request file content from primary
+    Message read_msg;
+    memset(&read_msg, 0, sizeof(read_msg));
+    read_msg.type = MSG_READ_FILE;
+    strcpy(read_msg.filename, msg->filename);
+    strcpy(read_msg.username, "REPLICATION");
+    
+    send_message(primary_sock, &read_msg);
+    
+    // Receive file content
+    Message file_response;
+    if (receive_message(primary_sock, &file_response) != 0 || 
+        file_response.error_code != ERR_SUCCESS) {
+        response.error_code = ERR_FILE_NOT_FOUND;
+        strcpy(response.data, "Failed to read from primary");
+        send_message(nm_sock, &response);
+        close(primary_sock);
+        log_message("SS", "❌ Failed to read '%s' from primary", msg->filename);
+        return;
+    }
+    
+    close(primary_sock);
+    
+    // Write content to local file
+    if (write_file_content(msg->filename, file_response.data) == 0) {
+        response.error_code = ERR_SUCCESS;
+        sprintf(response.data, "✓ Replicated %d bytes", file_response.data_len);
+        log_message("SS", "✅ Successfully replicated '%s' (%d bytes)", 
+                   msg->filename, file_response.data_len);
+    } else {
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "Failed to write replica");
+        log_message("SS", "❌ Failed to write replica of '%s'", msg->filename);
+    }
+    
+    send_message(nm_sock, &response);
+}
+
 // Handle READ request
 void handle_read(int sock, Message* msg) {
     char buffer[MAX_BUFFER_SIZE];
@@ -548,7 +686,8 @@ void handle_write(int sock, Message* msg) {
         int word_index = update_msg.word_index;
         char* new_content = update_msg.data;
         
-        // Parse working_sentence into words
+        // Parse working_sentence into words, treating delimiters as separate tokens
+        // "hi bye." becomes ["hi", "bye", "."]
         char words[1000][MAX_WORD_LENGTH];
         int word_count = 0;
         
@@ -558,8 +697,31 @@ void handle_write(int sock, Message* msg) {
         char* saveptr;
         char* token = strtok_r(temp_sentence, " ", &saveptr);
         while (token != NULL && word_count < 1000) {
-            strcpy(words[word_count], token);
-            word_count++;
+            int len = strlen(token);
+            
+            // Check if token ends with a delimiter
+            if (len > 1 && (token[len-1] == '.' || token[len-1] == '!' || token[len-1] == '?')) {
+                // Split into word and delimiter
+                char word_part[MAX_WORD_LENGTH];
+                strncpy(word_part, token, len - 1);
+                word_part[len - 1] = '\0';
+                
+                // Add the word part
+                strcpy(words[word_count], word_part);
+                word_count++;
+                
+                // Add the delimiter as separate word
+                if (word_count < 1000) {
+                    words[word_count][0] = token[len - 1];
+                    words[word_count][1] = '\0';
+                    word_count++;
+                }
+            } else {
+                // Normal word or standalone delimiter
+                strcpy(words[word_count], token);
+                word_count++;
+            }
+            
             token = strtok_r(NULL, " ", &saveptr);
         }
         
@@ -596,25 +758,46 @@ void handle_write(int sock, Message* msg) {
         
         // Add words before insertion point
         for (int i = 0; i < word_index; i++) {
-            if (strlen(new_sentence) > 0) strcat(new_sentence, " ");
+            // Check if this word is a delimiter
+            int is_delimiter = (strlen(words[i]) == 1 && 
+                              (words[i][0] == '.' || words[i][0] == '!' || words[i][0] == '?'));
+            
+            if (!is_delimiter && strlen(new_sentence) > 0) {
+                strcat(new_sentence, " ");
+            }
             strcat(new_sentence, words[i]);
         }
         
         // Add new content words
         for (int i = 0; i < content_word_count; i++) {
-            if (strlen(new_sentence) > 0) strcat(new_sentence, " ");
+            if (strlen(new_sentence) > 0 && 
+                new_sentence[strlen(new_sentence)-1] != '.' && 
+                new_sentence[strlen(new_sentence)-1] != '!' && 
+                new_sentence[strlen(new_sentence)-1] != '?') {
+                strcat(new_sentence, " ");
+            }
             strcat(new_sentence, content_words[i]);
         }
         
         // Add remaining words after insertion point
         for (int i = word_index; i < word_count; i++) {
-            if (strlen(new_sentence) > 0) strcat(new_sentence, " ");
+            // Check if this word is a delimiter
+            int is_delimiter = (strlen(words[i]) == 1 && 
+                              (words[i][0] == '.' || words[i][0] == '!' || words[i][0] == '?'));
+            
+            if (!is_delimiter && strlen(new_sentence) > 0 && 
+                new_sentence[strlen(new_sentence)-1] != '.' && 
+                new_sentence[strlen(new_sentence)-1] != '!' && 
+                new_sentence[strlen(new_sentence)-1] != '?') {
+                strcat(new_sentence, " ");
+            }
             strcat(new_sentence, words[i]);
         }
         
         // Update working_sentence
         strcpy(working_sentence, new_sentence);
         
+skip_word_update:  // Label for skipping invalid word updates
         // Send ACK for this word update
         Message ack;
         memset(&ack, 0, sizeof(ack));
@@ -744,6 +927,13 @@ void handle_write(int sock, Message* msg) {
     
     log_to_file("WRITE: %s by %s, sentence %d (%d total sentences)", 
                 msg->filename, msg->username, sentence_index, fresh_sentence_count);
+    
+    // Trigger async replication to secondary storage server
+    printf("[DEBUG] About to trigger replication for: %s\n", msg->filename);
+    fflush(stdout);
+    trigger_replication(msg->filename);
+    printf("[DEBUG] trigger_replication() call completed for: %s\n", msg->filename);
+    fflush(stdout);
 }
 
 // Handle STREAM request
@@ -1149,35 +1339,11 @@ void* handle_nm_request(void* arg) {
             }
             
             case MSG_SS_REPLICATE: {
-                // Replicate file content from primary to this server
-                char file_path[512];
-                snprintf(file_path, sizeof(file_path), "%s/%s", STORAGE_DIR, msg.filename);
-                
-                // Ensure parent directory exists
-                char* last_slash = strrchr(file_path, '/');
-                if (last_slash) {
-                    char parent_dir[512];
-                    strncpy(parent_dir, file_path, last_slash - file_path);
-                    parent_dir[last_slash - file_path] = '\0';
-                    create_folder_recursive(parent_dir);
-                }
-                
-                // Write replicated content to file
-                FILE* f = fopen(file_path, "w");
-                if (!f) {
-                    response.error_code = ERR_SERVER_ERROR;
-                    strcpy(response.data, "ERROR: Cannot write replica file");
-                    log_message("SS", "Failed to write replica for %s", msg.filename);
-                    break;
-                }
-                
-                fwrite(msg.data, 1, msg.data_len, f);
-                fclose(f);
-                
-                response.error_code = ERR_SUCCESS;
-                sprintf(response.data, "✓ Replica updated for '%s'", msg.filename);
-                log_message("SS", "Replica updated: %s (%d bytes)", msg.filename, msg.data_len);
-                break;
+                // This secondary server receives replication request from Name Server
+                // msg.ss_ip and msg.ss_port contain primary server info
+                handle_replicate_from_primary(nm_sock, &msg);
+                // Response is sent inside the handler
+                continue; // Skip the send_message at the end
             }
                 
             default:
@@ -1336,6 +1502,10 @@ int main(int argc, char* argv[]) {
     strncpy(nm_ip, argv[3], sizeof(nm_ip) - 1);
     nm_ip[sizeof(nm_ip) - 1] = '\0';
     
+    // Set unique storage directories based on client port
+    snprintf(STORAGE_DIR, sizeof(STORAGE_DIR), "./storage%d", client_port);
+    snprintf(UNDO_DIR, sizeof(UNDO_DIR), "./undo%d", client_port);
+    
     // Get local IP address
     get_local_ip(my_ip, sizeof(my_ip));
     
@@ -1343,13 +1513,17 @@ int main(int argc, char* argv[]) {
     log_message("SS", "My IP: %s", my_ip);
     log_message("SS", "Client port: %d, NM listen port: %d", client_port, nm_listen_port);
     log_message("SS", "Name Server IP: %s:%d", nm_ip, nm_port);
+    log_message("SS", "Storage directory: %s", STORAGE_DIR);
+    log_message("SS", "Undo directory: %s", UNDO_DIR);
     
     // Create directories
     mkdir(STORAGE_DIR, 0755);
     mkdir(UNDO_DIR, 0755);
     
-    // Open log file
-    log_file = fopen("ss_log.txt", "a");
+    // Open log file (unique per storage server)
+    char log_filename[256];
+    snprintf(log_filename, sizeof(log_filename), "ss_log_%d.txt", client_port);
+    log_file = fopen(log_filename, "a");
     if (!log_file) {
         log_message("SS", "Warning: Cannot open log file");
     }
