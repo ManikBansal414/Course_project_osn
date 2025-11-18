@@ -1,9 +1,9 @@
 #include "common.h"
 
-#define NM_IP "127.0.0.1"
 #define NM_PORT 8080
 
 char username[MAX_USERNAME];
+char nm_ip[50];  // Store the Name Server IP
 int nm_sock = -1;
 
 // Function prototypes
@@ -42,9 +42,9 @@ void cmd_metrics();
 
 // Connect to Name Server
 void connect_to_nm() {
-    nm_sock = connect_to_server(NM_IP, NM_PORT);
+    nm_sock = connect_to_server(nm_ip, NM_PORT);
     if (nm_sock < 0) {
-        printf("ERROR: Cannot connect to Name Server at %s:%d\n", NM_IP, NM_PORT);
+        printf("ERROR: Cannot connect to Name Server at %s:%d\n", nm_ip, NM_PORT);
         exit(1);
     }
     
@@ -970,10 +970,23 @@ void handle_command(const char* command) {
     }
 }
 
-int main() {
+int main(int argc, char *argv[]) {
     printf("═══════════════════════════════════════════════════════════\n");
     printf("        DISTRIBUTED FILE SYSTEM - CLIENT                   \n");
     printf("═══════════════════════════════════════════════════════════\n\n");
+    
+    // Check if IP address is provided as argument
+    if (argc < 2) {
+        printf("Usage: %s <name_server_ip>\n", argv[0]);
+        printf("Example: %s 10.42.0.238\n", argv[0]);
+        return 1;
+    }
+    
+    // Get Name Server IP from command line argument
+    strncpy(nm_ip, argv[1], sizeof(nm_ip) - 1);
+    nm_ip[sizeof(nm_ip) - 1] = '\0';
+    
+    printf("Connecting to Name Server at: %s:%d\n\n", nm_ip, NM_PORT);
     
     // Get username
     printf("Enter username: ");
