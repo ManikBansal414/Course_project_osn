@@ -1,3 +1,4 @@
+#include "common.h"
 // This file contains bonus feature handlers to be integrated into name_server.c
 
 // ═══════════════════════════════════════════════════════════════════

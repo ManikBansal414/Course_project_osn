@@ -1,6 +1,7 @@
 #include "common.h"
 #include <stdarg.h>
 #include <dirent.h>
+#include <sys/stat.h>
 
 #define STORAGE_DIR "./storage"
 #define UNDO_DIR "./undo"
@@ -14,6 +15,7 @@ typedef struct {
 
 // Global variables
 char nm_ip[INET_ADDRSTRLEN] = "127.0.0.1";
+char my_ip[INET_ADDRSTRLEN] = "127.0.0.1";  // This server's IP address
 int nm_port = 8080;
 int client_port = 9000;
 int nm_listen_port = 9001;
@@ -29,6 +31,7 @@ int should_exit = 0; // Flag to stop threads on shutdown
 
 // Function prototypes
 void register_with_nm();
+void get_local_ip(char* buffer, size_t size);
 void* handle_nm_request(void* arg);
 void* handle_client_request(void* arg);
 void* heartbeat_thread(void* arg); // Bonus: Send periodic heartbeats
@@ -60,6 +63,39 @@ void log_to_file(const char* format, ...) {
     
     fprintf(log_file, "\n");
     fflush(log_file);
+}
+
+// Get local IP address
+void get_local_ip(char* buffer, size_t size) {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        strncpy(buffer, "127.0.0.1", size);
+        return;
+    }
+    
+    struct sockaddr_in server;
+    memset(&server, 0, sizeof(server));
+    server.sin_family = AF_INET;
+    server.sin_addr.s_addr = inet_addr("8.8.8.8");  // Google DNS
+    server.sin_port = htons(53);
+    
+    // Connect to determine which interface would be used
+    if (connect(sock, (struct sockaddr*)&server, sizeof(server)) < 0) {
+        close(sock);
+        strncpy(buffer, "127.0.0.1", size);
+        return;
+    }
+    
+    struct sockaddr_in local;
+    socklen_t len = sizeof(local);
+    if (getsockname(sock, (struct sockaddr*)&local, &len) < 0) {
+        close(sock);
+        strncpy(buffer, "127.0.0.1", size);
+        return;
+    }
+    
+    inet_ntop(AF_INET, &local.sin_addr, buffer, size);
+    close(sock);
 }
 
 // Parse content into sentences
@@ -1179,7 +1215,16 @@ void register_with_nm() {
     if (dir) {
         struct dirent* entry;
         while ((entry = readdir(dir)) != NULL) {
-            if (entry->d_type == DT_REG) {
+            // Skip . and .. directories
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            
+            // Check if it's a regular file by trying to stat it
+            char filepath[512];
+            snprintf(filepath, sizeof(filepath), "%s/%s", STORAGE_DIR, entry->d_name);
+            struct stat st;
+            if (stat(filepath, &st) == 0 && S_ISREG(st.st_mode)) {
                 offset += snprintf(file_list + offset, sizeof(file_list) - offset, 
                     "%s\n", entry->d_name);
             }
@@ -1191,7 +1236,7 @@ void register_with_nm() {
     Message msg;
     memset(&msg, 0, sizeof(msg));
     msg.type = MSG_REGISTER_SS;
-    strcpy(msg.ss_ip, "127.0.0.1");
+    strcpy(msg.ss_ip, my_ip);  // Use actual IP instead of 127.0.0.1
     msg.ss_port = nm_listen_port;
     msg.flags = client_port; // Store client port in flags
     strcpy(msg.data, file_list);
@@ -1234,7 +1279,7 @@ void* heartbeat_thread(void* arg) {
         Message msg;
         memset(&msg, 0, sizeof(msg));
         msg.type = MSG_HEARTBEAT;
-        strcpy(msg.ss_ip, "127.0.0.1");
+        strcpy(msg.ss_ip, my_ip);  // Use actual IP instead of 127.0.0.1
         msg.ss_port = nm_listen_port;
         
         send_message(sock, &msg);
@@ -1280,15 +1325,24 @@ void* nm_listener(void* arg) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc >= 2) {
-        client_port = atoi(argv[1]);
-    }
-    if (argc >= 3) {
-        nm_listen_port = atoi(argv[2]);
+    if (argc < 4) {
+        printf("Usage: %s <client_port> <nm_port> <nm_ip>\n", argv[0]);
+        printf("Example: %s 9000 9001 10.42.0.238\n", argv[0]);
+        return 1;
     }
     
+    client_port = atoi(argv[1]);
+    nm_listen_port = atoi(argv[2]);
+    strncpy(nm_ip, argv[3], sizeof(nm_ip) - 1);
+    nm_ip[sizeof(nm_ip) - 1] = '\0';
+    
+    // Get local IP address
+    get_local_ip(my_ip, sizeof(my_ip));
+    
     log_message("SS", "Starting Storage Server");
+    log_message("SS", "My IP: %s", my_ip);
     log_message("SS", "Client port: %d, NM listen port: %d", client_port, nm_listen_port);
+    log_message("SS", "Name Server IP: %s:%d", nm_ip, nm_port);
     
     // Create directories
     mkdir(STORAGE_DIR, 0755);
