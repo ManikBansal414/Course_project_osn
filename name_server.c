@@ -113,6 +113,7 @@ int count_folders();
 // Bonus: Fault tolerance
 void* monitor_storage_servers(void* arg);
 void handle_heartbeat(Message* msg);
+void handle_replication_request(int client_sock, Message* msg);
 
 // Initialize LRU cache
 void init_cache() {
@@ -578,18 +579,48 @@ void handle_create(int client_sock, Message* msg) {
         return;
     }
     
-    // Find available storage server
+    // Find available storage server - RANDOM assignment for load balancing
     int ss_index = -1;
     int replica_ss_index = -1;
     
-    for (int i = 0; i < num_storage_servers; i++) {
-        if (storage_servers[i].is_active) {
-            if (ss_index < 0) {
-                ss_index = i; // Primary server
-            } else if (replica_ss_index < 0) {
-                replica_ss_index = i; // Replica server
+    if (num_storage_servers >= 2) {
+        // Use filename as seed for randomness (consistent for same file)
+        srand(time(NULL) + (unsigned int)strlen(msg->filename));
+        
+        // Randomly select primary
+        int primary_idx = rand() % num_storage_servers;
+        
+        // Find first active server starting from random position
+        for (int i = 0; i < num_storage_servers; i++) {
+            int idx = (primary_idx + i) % num_storage_servers;
+            if (storage_servers[idx].is_active) {
+                ss_index = idx;
                 break;
             }
+        }
+        
+        // Randomly select secondary (different from primary)
+        if (ss_index >= 0) {
+            int secondary_idx = (ss_index + 1 + (rand() % (num_storage_servers - 1))) % num_storage_servers;
+            
+            for (int i = 0; i < num_storage_servers; i++) {
+                int idx = (secondary_idx + i) % num_storage_servers;
+                if (idx != ss_index && storage_servers[idx].is_active) {
+                    replica_ss_index = idx;
+                    break;
+                }
+            }
+        }
+        
+        log_message("NM", "File '%s' assigned: Primary=SS%d, Secondary=SS%d", 
+                   msg->filename, ss_index, replica_ss_index);
+    } else if (num_storage_servers == 1) {
+        // Only one server available
+        if (storage_servers[0].is_active) {
+            ss_index = 0;
+            replica_ss_index = -1;
+            log_message("NM", "File '%s' assigned: Primary=SS%d (No secondary available)", 
+                       msg->filename, ss_index);
         }
     }
     
@@ -741,7 +772,7 @@ void handle_delete(int client_sock, Message* msg) {
             // Remove from metadata
             pthread_mutex_lock(&data_mutex);
             
-            // Remove from hash table and linked list
+            // Remove from linked list
             FileNode* prev = NULL;
             FileNode* current = file_list;
             while (current) {
@@ -759,9 +790,35 @@ void handle_delete(int client_sock, Message* msg) {
                 current = current->next;
             }
             
-            // Clear from hash table
+            // Remove from hash table (properly handle chaining)
             unsigned int index = hash_function(msg->filename);
-            file_hash[index] = NULL;
+            HashEntry* hash_prev = NULL;
+            HashEntry* hash_current = file_hash[index];
+            while (hash_current) {
+                if (strcmp(hash_current->key, msg->filename) == 0) {
+                    if (hash_prev) {
+                        hash_prev->file->next = hash_current->file->next;
+                    } else {
+                        if (hash_current->file->next) {
+                            file_hash[index] = (HashEntry*)hash_current->file->next;
+                        } else {
+                            file_hash[index] = NULL;
+                        }
+                    }
+                    free(hash_current);
+                    break;
+                }
+                hash_prev = hash_current;
+                hash_current = (HashEntry*)hash_current->file->next;
+            }
+            
+            // Clear from cache
+            unsigned int cache_index = hash_function(msg->filename) % LRU_CACHE_SIZE;
+            if (cache.cache_map[cache_index] && 
+                strcmp(cache.cache_map[cache_index]->key, msg->filename) == 0) {
+                free(cache.cache_map[cache_index]);
+                cache.cache_map[cache_index] = NULL;
+            }
             
             save_metadata();
             pthread_mutex_unlock(&data_mutex);
@@ -803,13 +860,37 @@ void handle_direct_ss_operation(int client_sock, Message* msg) {
             response.error_code = ERR_UNAUTHORIZED;
             strcpy(response.data, "ERROR: Unauthorized access");
         } else {
+            // Update last accessed time
+            time(&file->metadata.last_accessed);
+            
+            // Update last modified time for write operations
+            if (msg->type == MSG_WRITE_FILE) {
+                time(&file->metadata.last_modified);
+            }
+            
             response.error_code = ERR_SUCCESS;
             strcpy(response.ss_ip, storage_servers[file->metadata.ss_index].ip);
             response.ss_port = storage_servers[file->metadata.ss_index].client_port;
             strcpy(response.folder_path, file->metadata.folder_path); // Send folder path to client
-            sprintf(response.data, "Connect to SS at %s:%d", response.ss_ip, response.ss_port);
+            
+            // Include replica information in the response
+            if (msg->type == MSG_WRITE_FILE && file->metadata.replica_ss_index >= 0 && 
+                file->metadata.replica_ss_index < num_storage_servers &&
+                storage_servers[file->metadata.replica_ss_index].is_active) {
+                // Add replica info to data: PRIMARY_SS_INDEX|REPLICA_SS_INDEX|REPLICA_IP|REPLICA_PORT
+                sprintf(response.data, "Primary:SS%d|Replica:SS%d:%s:%d", 
+                       file->metadata.ss_index,
+                       file->metadata.replica_ss_index,
+                       storage_servers[file->metadata.replica_ss_index].ip,
+                       storage_servers[file->metadata.replica_ss_index].nm_port);
+            } else {
+                sprintf(response.data, "Connect to SS at %s:%d", response.ss_ip, response.ss_port);
+            }
         }
     }
+    
+    // Save metadata to persist timestamp updates
+    save_metadata();
     
     pthread_mutex_unlock(&data_mutex);
     
@@ -1728,6 +1809,86 @@ void handle_heartbeat(Message* msg) {
     log_message("NM", "Received heartbeat from unknown SS %s:%d", msg->ss_ip, msg->ss_port);
 }
 
+// Handle replication request - Notifies secondary to replicate from primary
+void handle_replication_request(int client_sock, Message* msg) {
+    printf("[DEBUG NM] Received replication request for: %s\n", msg->filename);
+    fflush(stdout);
+    
+    pthread_mutex_lock(&data_mutex);
+    
+    FileNode* file = find_file(msg->filename);
+    
+    Message response;
+    memset(&response, 0, sizeof(response));
+    response.type = MSG_ACK;
+    
+    if (!file) {
+        printf("[DEBUG NM] File not found: %s\n", msg->filename);
+        fflush(stdout);
+        response.error_code = ERR_FILE_NOT_FOUND;
+        strcpy(response.data, "File not found");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        return;
+    }
+    
+    int replica_idx = file->metadata.replica_ss_index;
+    
+    printf("[DEBUG NM] File found. Primary SS: %d, Replica SS: %d\n", 
+           file->metadata.ss_index, replica_idx);
+    fflush(stdout);
+    
+    if (replica_idx < 0 || replica_idx >= num_storage_servers || !storage_servers[replica_idx].is_active) {
+        response.error_code = ERR_NO_STORAGE_SERVER;
+        strcpy(response.data, "No active replica server");
+        pthread_mutex_unlock(&data_mutex);
+        send_message(client_sock, &response);
+        log_message("NM", "No active replica for %s", msg->filename);
+        return;
+    }
+    
+    int primary_idx = file->metadata.ss_index;
+    
+    pthread_mutex_unlock(&data_mutex);
+    
+    // Connect to secondary/replica storage server
+    int replica_sock = connect_to_server(storage_servers[replica_idx].ip, 
+                                         storage_servers[replica_idx].nm_port);
+    
+    if (replica_sock < 0) {
+        response.error_code = ERR_CONNECTION_FAILED;
+        strcpy(response.data, "Cannot connect to replica server");
+        send_message(client_sock, &response);
+        log_message("NM", "Failed to connect to replica SS%d for %s", replica_idx, msg->filename);
+        return;
+    }
+    
+    // Send replication command to secondary
+    Message repl_msg;
+    memset(&repl_msg, 0, sizeof(repl_msg));
+    repl_msg.type = MSG_SS_REPLICATE;
+    strcpy(repl_msg.filename, msg->filename);
+    strcpy(repl_msg.ss_ip, storage_servers[primary_idx].ip);
+    repl_msg.ss_port = storage_servers[primary_idx].client_port;
+    repl_msg.flags = primary_idx; // Store primary index
+    
+    send_message(replica_sock, &repl_msg);
+    
+    Message repl_response;
+    if (receive_message(replica_sock, &repl_response) == 0) {
+        response.error_code = repl_response.error_code;
+        strcpy(response.data, repl_response.data);
+        log_message("NM", "🔄 Replication of '%s' from SS%d to SS%d: %s", 
+                   msg->filename, primary_idx, replica_idx, repl_response.data);
+    } else {
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "Replication communication failed");
+    }
+    
+    close(replica_sock);
+    send_message(client_sock, &response);
+}
+
 // Monitor storage servers for failures
 void* monitor_storage_servers(void* arg) {
     log_message("NM", "Starting storage server monitoring thread");
@@ -1807,25 +1968,14 @@ void* handle_client(void* arg) {
                     storage_servers[num_storage_servers].is_active = 1;
                     time(&storage_servers[num_storage_servers].last_heartbeat);
                     
-                    // Parse file list from msg.data and add to metadata
+                    // Parse file list from msg.data (for recovery/sync purposes only)
+                    // Note: We don't add these to metadata as they should only be created via client CREATE
                     char data_copy[MAX_BUFFER_SIZE];
                     strcpy(data_copy, msg.data);
                     char* token = strtok(data_copy, "\n");
                     while (token) {
-                        // Check if file already exists
-                        if (!find_file(token)) {
-                            FileMetadata metadata;
-                            strcpy(metadata.filename, token);
-                            strcpy(metadata.owner, "system");
-                            time(&metadata.created);
-                            metadata.last_modified = metadata.created;
-                            metadata.last_accessed = metadata.created;
-                            metadata.word_count = 0;
-                            metadata.char_count = 0;
-                            metadata.ss_index = num_storage_servers;
-                            
-                            add_file(&metadata);
-                        }
+                        // Just acknowledge existing files, don't add to metadata
+                        // Files should only be in metadata if created via CREATE command
                         token = strtok(NULL, "\n");
                     }
                     
@@ -1948,6 +2098,10 @@ void* handle_client(void* arg) {
             case MSG_HEARTBEAT:
                 handle_heartbeat(&msg);
                 break;
+            
+            case MSG_SS_REPLICATE:
+                handle_replication_request(client_sock, &msg);
+                break;
                 
             default:
                 log_message("NM", "Unknown message type: %d", msg.type);
@@ -1975,23 +2129,12 @@ void* handle_storage_server(void* arg) {
             storage_servers[num_storage_servers].is_active = 1;
             time(&storage_servers[num_storage_servers].last_heartbeat);
             
-            // Parse file list from msg.data and add to metadata
+            // Parse file list from msg.data (for recovery/sync purposes only)
+            // Note: We don't add these to metadata as they should only be created via client CREATE
             char* token = strtok(msg.data, "\n");
             while (token) {
-                // Check if file already exists
-                if (!find_file(token)) {
-                    FileMetadata metadata;
-                    strcpy(metadata.filename, token);
-                    strcpy(metadata.owner, "system");
-                    time(&metadata.created);
-                    metadata.last_modified = metadata.created;
-                    metadata.last_accessed = metadata.created;
-                    metadata.word_count = 0;
-                    metadata.char_count = 0;
-                    metadata.ss_index = num_storage_servers;
-                    
-                    add_file(&metadata);
-                }
+                // Just acknowledge existing files, don't add to metadata
+                // Files should only be in metadata if created via CREATE command
                 token = strtok(NULL, "\n");
             }
             
